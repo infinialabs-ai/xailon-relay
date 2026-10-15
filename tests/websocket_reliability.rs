@@ -1,0 +1,352 @@
+use std::{
+    net::TcpListener,
+    path::Path,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
+
+use futures_util::{SinkExt, StreamExt};
+use relay::{ClientFrame, Endpoint, ServerFrame};
+use serde_json::json;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message, Result as WebSocketResult},
+};
+
+struct RelayServer {
+    child: Option<Child>,
+}
+
+impl RelayServer {
+    fn spawn(port: u16, database: &Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .args([
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--database",
+                database.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self { child: Some(child) }
+    }
+
+    fn stop(mut self) {
+        self.terminate();
+    }
+
+    fn spawn_with_debug_logs(port: u16, database: &Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .args([
+                "--debug",
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--database",
+                database.to_str().unwrap(),
+            ])
+            .env_remove("RUST_LOG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Self { child: Some(child) }
+    }
+
+    fn stop_and_collect_stderr(mut self) -> String {
+        let mut child = self.child.take().unwrap();
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        String::from_utf8(output.stderr).unwrap()
+    }
+
+    fn terminate(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for RelayServer {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+async fn connect(port: u16, id: &str, endpoint: Endpoint, device_id: &str) -> Socket {
+    let url = format!("ws://127.0.0.1:{port}/ws?id={id}&endpoint={endpoint}&device_id={device_id}");
+    for _ in 0..100 {
+        match connect_async(&url).await {
+            Ok((socket, _)) => return socket,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    panic!("relay server did not start at {url}");
+}
+
+async fn send(socket: &mut Socket, frame: &ClientFrame) -> WebSocketResult<()> {
+    socket
+        .send(Message::Text(serde_json::to_string(frame).unwrap().into()))
+        .await
+}
+
+async fn receive(socket: &mut Socket) -> ServerFrame {
+    loop {
+        match socket.next().await.unwrap().unwrap() {
+            Message::Text(text) => return serde_json::from_str(&text).unwrap(),
+            Message::Ping(payload) => socket.send(Message::Pong(payload)).await.unwrap(),
+            other => panic!("unexpected WebSocket message: {other:?}"),
+        }
+    }
+}
+
+async fn expect_ready(socket: &mut Socket, endpoint: Endpoint) {
+    assert_eq!(receive(socket).await, ServerFrame::Ready { endpoint });
+}
+
+#[tokio::test]
+async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.sqlite3");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let server = RelayServer::spawn(port, &database);
+
+    let mut endpoint_one = connect(port, "pair-a", Endpoint::One, "dev-1").await;
+    expect_ready(&mut endpoint_one, Endpoint::One).await;
+    let mut another_endpoint_one = connect(port, "pair-a", Endpoint::One, "dev-2").await;
+    expect_ready(&mut another_endpoint_one, Endpoint::One).await;
+
+    let mut unrelated_endpoint_two = connect(port, "pair-b", Endpoint::Two, "dev-1").await;
+    expect_ready(&mut unrelated_endpoint_two, Endpoint::Two).await;
+
+    send(
+        &mut endpoint_one,
+        &ClientFrame::Message {
+            message_id: "endpoint_one-1".to_string(),
+            payload: json!({ "request": 1 }),
+            target_device_id: None,
+            ephemeral: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut endpoint_one).await,
+        ServerFrame::Stored {
+            message_id: "endpoint_one-1".to_string()
+        }
+    );
+    let mut unrelated_endpoint_one = connect(port, "pair-b", Endpoint::One, "dev-1").await;
+    expect_ready(&mut unrelated_endpoint_one, Endpoint::One).await;
+    send(
+        &mut unrelated_endpoint_one,
+        &ClientFrame::Message {
+            message_id: "pair-b-sentinel".to_string(),
+            payload: json!({ "pair": "b" }),
+            target_device_id: None,
+            ephemeral: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut unrelated_endpoint_one).await,
+        ServerFrame::Stored {
+            message_id: "pair-b-sentinel".to_string(),
+        }
+    );
+    assert_eq!(
+        receive(&mut unrelated_endpoint_two).await,
+        ServerFrame::Message {
+            message_id: "pair-b-sentinel".to_string(),
+            sequence: 1,
+            payload: json!({ "pair": "b" }),
+        },
+        "pair-b received a message belonging to another relay id"
+    );
+
+    let mut endpoint_two = connect(port, "pair-a", Endpoint::Two, "dev-1").await;
+    expect_ready(&mut endpoint_two, Endpoint::Two).await;
+    assert_eq!(
+        receive(&mut endpoint_two).await,
+        ServerFrame::Message {
+            message_id: "endpoint_one-1".to_string(),
+            sequence: 1,
+            payload: json!({ "request": 1 }),
+        }
+    );
+    send(&mut endpoint_two, &ClientFrame::Ack { sequence: 1 })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    endpoint_two.close(None).await.unwrap();
+
+    send(
+        &mut endpoint_one,
+        &ClientFrame::Message {
+            message_id: "endpoint_one-2".to_string(),
+            payload: json!({ "request": 2 }),
+            target_device_id: None,
+            ephemeral: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut endpoint_one).await,
+        ServerFrame::Stored {
+            message_id: "endpoint_one-2".to_string()
+        }
+    );
+    drop(endpoint_one);
+    server.stop();
+
+    let _restarted_server = RelayServer::spawn(port, &database);
+    let mut reconnected_endpoint_two = connect(port, "pair-a", Endpoint::Two, "dev-1").await;
+    expect_ready(&mut reconnected_endpoint_two, Endpoint::Two).await;
+    assert_eq!(
+        receive(&mut reconnected_endpoint_two).await,
+        ServerFrame::Message {
+            message_id: "endpoint_one-2".to_string(),
+            sequence: 2,
+            payload: json!({ "request": 2 }),
+        }
+    );
+}
+
+#[tokio::test]
+async fn debug_logs_connections_messages_and_disconnects() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.sqlite3");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let server = RelayServer::spawn_with_debug_logs(port, &database);
+
+    let mut socket = connect(port, "logged-pair", Endpoint::One, "dev-1").await;
+    expect_ready(&mut socket, Endpoint::One).await;
+    send(
+        &mut socket,
+        &ClientFrame::Message {
+            message_id: "logged-message".to_string(),
+            payload: json!({ "hello": "logs" }),
+            target_device_id: None,
+            ephemeral: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut socket).await,
+        ServerFrame::Stored {
+            message_id: "logged-message".to_string(),
+        }
+    );
+    socket.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let logs = server.stop_and_collect_stderr();
+    assert!(logs.contains("WebSocket endpoint connected"), "{logs}");
+    assert!(logs.contains("relay_id=logged-pair"), "{logs}");
+    assert!(logs.contains("message_id=logged-message"), "{logs}");
+    assert!(logs.contains("payload={\"hello\":\"logs\"}"), "{logs}");
+    assert!(logs.contains("WebSocket endpoint disconnected"), "{logs}");
+}
+
+#[tokio::test]
+async fn ack_head_purges_stale_messages_on_connect() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.sqlite3");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _server = RelayServer::spawn(port, &database);
+
+    // Endpoint::One sends two messages while Endpoint::Two is offline
+    let mut ep1 = connect(port, "pair-ack", Endpoint::One, "dev-1").await;
+    expect_ready(&mut ep1, Endpoint::One).await;
+
+    send(
+        &mut ep1,
+        &ClientFrame::Message {
+            message_id: "m-1".to_string(),
+            payload: json!({ "count": 1 }),
+            target_device_id: None,
+            ephemeral: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut ep1).await,
+        ServerFrame::Stored {
+            message_id: "m-1".to_string()
+        }
+    );
+
+    send(
+        &mut ep1,
+        &ClientFrame::Message {
+            message_id: "m-2".to_string(),
+            payload: json!({ "count": 2 }),
+            target_device_id: None,
+            ephemeral: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut ep1).await,
+        ServerFrame::Stored {
+            message_id: "m-2".to_string()
+        }
+    );
+
+    // Endpoint::Two connects cold with ack_head=true
+    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-ack&endpoint=2&device_id=dev-2&ack_head=true");
+    let (mut ep2, _) = connect_async(&url).await.unwrap();
+    expect_ready(&mut ep2, Endpoint::Two).await;
+
+    // ep1 sends message 3 live
+    send(
+        &mut ep1,
+        &ClientFrame::Message {
+            message_id: "m-3".to_string(),
+            payload: json!({ "count": 3 }),
+            target_device_id: None,
+            ephemeral: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut ep1).await,
+        ServerFrame::Stored {
+            message_id: "m-3".to_string()
+        }
+    );
+
+    // ep2 immediately receives message 3; messages 1 and 2 were purged and never replayed!
+    assert_eq!(
+        receive(&mut ep2).await,
+        ServerFrame::Message {
+            message_id: "m-3".to_string(),
+            sequence: 3,
+            payload: json!({ "count": 3 }),
+        }
+    );
+}
+
