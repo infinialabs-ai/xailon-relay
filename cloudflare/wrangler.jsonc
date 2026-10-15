@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "xailon-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-15",
+  // `node:crypto` provides the synchronous SHA-256 used for idempotency receipts.
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "routes": [{ "pattern": "xailon-relay.infinialabs.ai", "custom_domain": true }],
+  "durable_objects": {
+    "bindings": [{ "name": "CHANNEL", "class_name": "Channel" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Channel"] }],
+  // Same defaults as the Rust relay; all optional. See README "Cloudflare".
+  "vars": {
+    "MAX_PENDING_MESSAGES": "100000",
+    "MAX_PENDING_BYTES": "1073741824",
+    "PENDING_RETENTION_SECS": "3600",
+    "RECEIPT_RETENTION_SECS": "3600",
+    "DEVICE_RETENTION_SECS": "604800"
+  }
+}

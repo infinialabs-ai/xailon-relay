@@ -1,6 +1,6 @@
 # Xailon Relay
 
-Durable WebSocket relay used by [XailonOrbit](https://github.com/infinialabs-ai/xailon-orbit) to connect the mobile app with `xailon-orbitd`. The public instance runs at `wss://xailon-relay.infinialabs.ai/ws`.
+Durable WebSocket relay used by [XailonOrbit](https://github.com/infinialabs-ai/xailon-orbit) to connect the mobile app with `xailon-orbitd`. The public instance runs on Cloudflare at `wss://xailon-relay.infinialabs.ai/ws` (see [Cloudflare (hosted)](#cloudflare-hosted)); the Rust server below is the self-hosted alternative. Both speak the same wire protocol.
 
 ## Overview
 
@@ -41,6 +41,91 @@ to override the log filter.
 
 For an internet-facing deployment, terminate TLS in a reverse proxy and expose
 the WebSocket endpoint over `wss://`.
+
+## Cloudflare (hosted)
+
+`cloudflare/` is a port of the server to a Cloudflare Worker, and is what
+runs at `xailon-relay.infinialabs.ai`. It is wire-compatible with the Rust
+server: same `/ws` query parameters, frames, binary layout, delivery
+contract and error strings, so `client-ts` and `client-rs` work unchanged.
+
+**Architecture**
+
+- The Worker validates `/ws` connections and routes each one to a Durable
+  Object named by the pairing id (`idFromName(id)`). One object per pairing
+  id plays the role of the Rust relay's per-id lock: its handlers run one at
+  a time, so sequence assignment and acknowledgements need no locking.
+- Each object keeps that channel's counters, receipts, pending messages and
+  device cursors in its own SQLite storage. Payloads are stored in chunks,
+  because one Durable Object row holds at most 2 MB and messages can be up
+  to 10 MiB.
+- Sockets use the WebSocket Hibernation API, so idle connections cost
+  nothing. Expiry runs from a Durable Object alarm set for the next due
+  pending message, receipt or device, instead of a fixed cleanup interval.
+- `POST /push` forwards xailon-orbitd completion notifications to Firebase
+  Cloud Messaging (HTTP v1). Only the device tokens and agent/session ids are
+  taken from the request; the notification is built from a fixed template.
+  Without the `FCM_SERVICE_ACCOUNT` secret it answers `503`.
+- `GET /health` returns `200 OK`.
+
+**Deploy to your own Cloudflare account** (the Free plan is enough: SQLite
+Durable Objects are included):
+
+```sh
+cd cloudflare
+npm install
+# Either log in interactively…
+npx wrangler login
+# …or use an API token with "Workers Scripts: Edit" and, for a custom domain,
+# "Zone: DNS: Edit" + "Workers Routes: Edit" on the zone.
+export CLOUDFLARE_API_TOKEN=...
+export CLOUDFLARE_ACCOUNT_ID=...
+```
+
+Edit `cloudflare/wrangler.jsonc`: set `routes[0].pattern` to your hostname (its
+zone must be in the same Cloudflare account; DNS and the certificate are
+created on deploy), or delete `routes` to use the `*.workers.dev` address.
+Then:
+
+```sh
+npx wrangler deploy
+curl https://relay.example.com/health   # OK
+```
+
+Clients connect to `wss://relay.example.com/ws`.
+
+Push notifications (optional): create a Firebase project with your app
+registered, create a service account with the *Firebase Cloud Messaging API
+Admin* role, download its JSON key, and store it as a secret:
+
+```sh
+npx wrangler secret put FCM_SERVICE_ACCOUNT < service-account.json
+```
+
+Limits are Worker variables in `wrangler.jsonc` with the same defaults as the
+Rust server: `MAX_PENDING_MESSAGES`, `MAX_PENDING_BYTES`,
+`PENDING_RETENTION_SECS`, `RECEIPT_RETENTION_SECS`, `DEVICE_RETENTION_SECS`.
+
+**Tests** start `wrangler dev` and drive the real `client-ts` end to end:
+
+```sh
+cd cloudflare
+npm test                                                  # local workerd
+RELAY_URL=wss://xailon-relay.infinialabs.ai/ws npm test   # a deployed relay
+```
+
+**Differences from the Rust server**
+
+- The relay does not send WebSocket pings (Workers cannot), and there is no
+  90-second idle timeout. Clients' pings are answered by Cloudflare, and idle
+  sockets stay open; a dead client is detected when its TCP connection drops.
+- There is no 16 MiB per-connection ephemeral queue budget: Workers do not
+  expose a socket's buffered amount, so an ephemeral message counts as
+  delivered once it is handed to the socket.
+- A preempted connection receives `connection_replaced` and is then ignored
+  until its client closes it, as in the Rust server.
+- Storage-backed limits are per pairing id, as in the Rust server; there is
+  no cross-channel database to shard.
 
 ## Docker
 
