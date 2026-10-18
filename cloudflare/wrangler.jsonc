@@ -11,12 +11,22 @@
     "bindings": [{ "name": "CHANNEL", "class_name": "Channel" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Channel"] }],
-  // Same defaults as the Rust relay; all optional. See README "Cloudflare".
+  // Per-IP limits on new connections and pushes (Workers Rate Limiting).
+  "ratelimits": [
+    { "name": "CONNECT_LIMITER", "namespace_id": "4101", "simple": { "limit": 120, "period": 60 } },
+    { "name": "PUSH_LIMITER", "namespace_id": "4102", "simple": { "limit": 30, "period": 60 } }
+  ],
+  // All optional. See README "Cloudflare". The hosted instance keeps smaller
+  // per-channel backlogs than the Rust relay's defaults.
   "vars": {
     "MAX_PENDING_MESSAGES": "100000",
-    "MAX_PENDING_BYTES": "1073741824",
+    "MAX_PENDING_BYTES": "67108864",
     "PENDING_RETENTION_SECS": "3600",
     "RECEIPT_RETENTION_SECS": "3600",
-    "DEVICE_RETENTION_SECS": "604800"
+    "DEVICE_RETENTION_SECS": "604800",
+    "PUSH_PER_HOUR": "120",
+    // Set REQUIRE_AUTH to "true" once every client sends a channel auth token.
+    "REQUIRE_AUTH": "false",
+    "ALLOW_UNAUTHENTICATED_PUSH": "false"
   }
 }

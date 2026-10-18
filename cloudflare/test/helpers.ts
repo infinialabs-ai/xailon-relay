@@ -12,6 +12,7 @@ import {
 
 /** Small enough for the queue_full test; each test uses its own pairing id. */
 export const LOCAL_MAX_PENDING_MESSAGES = 5;
+export const LOCAL_PUSH_PER_HOUR = 3;
 
 export const waitFor = async (condition: () => boolean, what: string, timeout = 10_000) => {
   const start = Date.now();
@@ -57,6 +58,8 @@ export const startRelay = async (): Promise<Relay> => {
       persist,
       '--var',
       `MAX_PENDING_MESSAGES:${LOCAL_MAX_PENDING_MESSAGES}`,
+      '--var',
+      `PUSH_PER_HOUR:${LOCAL_PUSH_PER_HOUR}`,
       '--show-interactive-dev-session=false',
     ],
     { cwd: new URL('..', import.meta.url).pathname, stdio: ['ignore', 'pipe', 'pipe'], env: process.env },
@@ -114,6 +117,7 @@ export type TestClient = {
   binaries: { data: Uint8Array; messageId: string }[];
   undeliverable: string[];
   states: RelayConnectionState[];
+  errors: string[];
   connected: () => Promise<void>;
 };
 
@@ -121,7 +125,13 @@ export const relayId = (name: string) => `test-${name}-${crypto.randomUUID()}`;
 
 export const createClient = (
   relay: Relay,
-  options: { relayId: string; endpoint: '1' | '2'; deviceId: string; store?: ReturnType<typeof memoryStore> },
+  options: {
+    relayId: string;
+    endpoint: '1' | '2';
+    deviceId: string;
+    store?: ReturnType<typeof memoryStore>;
+    authToken?: Uint8Array;
+  },
 ): TestClient => {
   const store = options.store ?? memoryStore(options.deviceId);
   const result: Omit<TestClient, 'client' | 'connected'> = {
@@ -130,12 +140,14 @@ export const createClient = (
     binaries: [],
     undeliverable: [],
     states: [],
+    errors: [],
   };
   const client = new RelayClient({
     relayId: options.relayId,
     endpoint: options.endpoint,
     deviceId: options.deviceId,
     relayUrl: relay.wsUrl,
+    authToken: options.authToken,
     store,
     onPayload: (payload) => {
       result.payloads.push(payload);
@@ -146,8 +158,9 @@ export const createClient = (
     onUndeliverable: (messageId) => {
       result.undeliverable.push(messageId);
     },
-    onStateChange: (state) => {
+    onStateChange: (state, error) => {
       result.states.push(state);
+      if (error) result.errors.push(error);
     },
   });
   return {

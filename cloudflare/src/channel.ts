@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from './index';
 
@@ -22,7 +22,10 @@ const opposite = (endpoint: Endpoint): Endpoint => (endpoint === '1' ? '2' : '1'
 const byteLength = (text: string) => new TextEncoder().encode(text).length;
 const now = () => Math.floor(Date.now() / 1000);
 
-export type ConnectQuery = { id: string; endpoint: Endpoint; deviceId: string; ackHead: boolean };
+export type ConnectQuery = { id: string; endpoint: Endpoint; deviceId: string; ackHead: boolean; auth: boolean };
+
+const BOOLEANS = ['', 'true', '1', 'yes', 'false', '0', 'no'];
+const isTrue = (value: string) => ['true', '1', 'yes'].includes(value);
 
 /** Mirrors the Rust relay's `ConnectQuery` deserialization and `validate_connection`. */
 export const parseConnectQuery = (params: URLSearchParams): ConnectQuery | string => {
@@ -30,19 +33,52 @@ export const parseConnectQuery = (params: URLSearchParams): ConnectQuery | strin
   const endpoint = params.get('endpoint');
   const deviceId = params.get('device_id');
   const ackHead = (params.get('ack_head') ?? '').toLowerCase();
+  const auth = (params.get('auth') ?? '').toLowerCase();
   if (id === null) return 'Failed to deserialize query string: missing field `id`';
   if (endpoint === null) return 'Failed to deserialize query string: missing field `endpoint`';
   if (deviceId === null) return 'Failed to deserialize query string: missing field `device_id`';
   if (endpoint !== '1' && endpoint !== '2') return 'Failed to deserialize query string: endpoint must be 1 or 2';
-  if (!['', 'true', '1', 'yes', 'false', '0', 'no'].includes(ackHead)) {
+  if (!BOOLEANS.includes(ackHead)) {
     return `Failed to deserialize query string: invalid boolean: ${params.get('ack_head')}`;
   }
+  if (!BOOLEANS.includes(auth)) return `Failed to deserialize query string: invalid boolean: ${params.get('auth')}`;
   if (!id) return 'id must not be empty';
   if (byteLength(id) > MAX_ID_BYTES) return 'id is too long';
   if (!deviceId) return 'device_id must not be empty';
   if (byteLength(deviceId) > MAX_ID_BYTES) return 'device_id is too long';
-  return { id, endpoint, deviceId, ackHead: ['true', '1', 'yes'].includes(ackHead) };
+  return { id, endpoint, deviceId, ackHead: isTrue(ackHead), auth: isTrue(auth) };
 };
+
+/**
+ * Channel auth, as in the Rust relay's `relay::auth`. A self-certifying id
+ * (`xrc1_…`) is the SHA-256 of its token; any other id is claimed by its first
+ * authenticated connection, and only a verifier of the token is stored.
+ */
+const CHANNEL_ID_PREFIX = 'xrc1_';
+
+const base64Url = (bytes: Uint8Array) =>
+  btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+/** Decodes a base64url (no padding) 32-byte token, or returns null. */
+export const decodeToken = (token: unknown): Uint8Array | null => {
+  if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
+  const bytes = Uint8Array.from(atob(token.replace(/-/g, '+').replace(/_/g, '/')), (char) => char.charCodeAt(0));
+  return bytes.length === 32 && base64Url(bytes) === token ? bytes : null;
+};
+
+export const channelId = (token: Uint8Array) =>
+  CHANNEL_ID_PREFIX + base64Url(createHash('sha256').update('xailon-relay/channel/v1\0').update(token).digest());
+
+const verifier = (id: string, token: Uint8Array) =>
+  createHash('sha256').update('xailon-relay/verifier/v1\0').update(id).update('\0').update(token).digest('hex');
+
+const constantTimeEqual = (a: string, b: string) => {
+  const left = new TextEncoder().encode(a);
+  const right = new TextEncoder().encode(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+};
+
+export type AuthResult = 'ok' | 'required' | 'failed';
 
 const validateMessageId = (messageId: string) => {
   if (!messageId) throw new Error('message_id must not be empty');
@@ -56,7 +92,8 @@ const validateTargetDeviceId = (deviceId: string) => {
 
 type ClientFrame =
   | { type: 'message'; message_id: string; payload: unknown; target_device_id?: string; ephemeral: boolean }
-  | { type: 'ack'; sequence: number };
+  | { type: 'ack'; sequence: number }
+  | { type: 'auth'; token: string };
 
 /** Validates a client frame as strictly as the Rust relay's serde types. */
 const parseClientFrame = (text: string): ClientFrame => {
@@ -67,6 +104,10 @@ const parseClientFrame = (text: string): ClientFrame => {
       throw new Error('sequence must be a non-negative integer');
     }
     return { type: 'ack', sequence: frame.sequence };
+  }
+  if (frame.type === 'auth') {
+    if (typeof frame.token !== 'string') throw new Error('token must be a string');
+    return { type: 'auth', token: frame.token };
   }
   if (frame.type === 'message') {
     if (typeof frame.message_id !== 'string') throw new Error('message_id must be a string');
@@ -86,7 +127,7 @@ const parseClientFrame = (text: string): ClientFrame => {
       ephemeral: frame.ephemeral ?? false,
     };
   }
-  throw new Error('unknown variant, expected `message` or `ack`');
+  throw new Error('unknown variant, expected `message`, `ack` or `auth`');
 };
 
 /** `[u16 big-endian header length][header JSON][body]`, as in `decode_binary_frame`. */
@@ -108,7 +149,13 @@ const decodeBinaryHeader = (frame: ArrayBuffer): { message_id: string; target_de
   return { message_id, target_device_id: target_device_id ?? undefined };
 };
 
-type Attachment = { endpoint: Endpoint; deviceId: string; replaced?: boolean };
+/** `awaitingAuth` sockets have opened with `auth=1` but not yet sent their token; they get and send nothing. */
+type Attachment = {
+  endpoint: Endpoint;
+  deviceId: string;
+  replaced?: boolean;
+  awaitingAuth?: { id: string; ackHead: boolean };
+};
 
 type Stored = { messageId: string; sequence: number; payloadText: string; targetDeviceId: string | null };
 
@@ -189,14 +236,45 @@ export class Channel extends DurableObject<Env> {
         last_seen_at INTEGER NOT NULL,
         PRIMARY KEY (endpoint, device_id)
       );
+      CREATE TABLE IF NOT EXISTS channel_auth (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        verifier TEXT NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS push_budget (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        hour INTEGER NOT NULL,
+        count INTEGER NOT NULL
+      );
     `);
   }
 
   async fetch(request: Request): Promise<Response> {
-    const query = parseConnectQuery(new URL(request.url).searchParams);
+    const url = new URL(request.url);
+    if (url.pathname === '/push-auth') return this.#pushAuth(request);
+    const query = parseConnectQuery(url.searchParams);
     if (typeof query === 'string') return new Response(query, { status: 400 });
     const { endpoint, deviceId } = query;
 
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server, [endpoint, `${endpoint}:${deviceId}`]);
+    // Admitted only once authenticated: until then the socket gets nothing
+    // and changes nothing about the channel.
+    server.serializeAttachment({
+      endpoint,
+      deviceId,
+      awaitingAuth: { id: query.id, ackHead: query.ackHead },
+    } satisfies Attachment);
+    if (query.auth) return new Response(null, { status: 101, webSocket: client });
+    const result = this.#authenticate(query.id, null);
+    if (result === 'ok') await this.#admit(server, endpoint, deviceId, query.ackHead);
+    else this.#refuse(server, result);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** Registers an authenticated (or legacy) connection: preemption, cursor, backlog, `ready`. */
+  async #admit(server: WebSocket, endpoint: Endpoint, deviceId: string, ackHead: boolean) {
     // Preemption: the newest connection for a device replaces the older one.
     // As in the Rust relay, the old client closes on `connection_replaced`;
     // until then it is ignored and receives nothing.
@@ -204,35 +282,112 @@ export class Channel extends DurableObject<Env> {
       previous.serializeAttachment({ ...(previous.deserializeAttachment() as Attachment), replaced: true });
       send(previous, { type: 'error', message: 'connection_replaced: another connection opened for this device' });
     }
-
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    this.ctx.acceptWebSocket(server, [endpoint, `${endpoint}:${deviceId}`]);
     server.serializeAttachment({ endpoint, deviceId } satisfies Attachment);
 
     let pending: Stored[];
     try {
       pending = this.ctx.storage.transactionSync(() => {
         this.#registerDevice(endpoint, deviceId);
-        if (query.ackHead) this.#acknowledgeHead(endpoint, deviceId);
+        if (ackHead) this.#acknowledgeHead(endpoint, deviceId);
         return this.#pendingForDevice(endpoint, deviceId);
       });
     } catch (error) {
       console.error('failed to prepare relay device', error);
       send(server, { type: 'error', message: 'relay_storage_unavailable: device registration failed' });
       server.close(1011, 'relay_storage_unavailable');
-      return new Response(null, { status: 101, webSocket: client });
+      return;
     }
 
     send(server, { type: 'ready', endpoint });
     for (const message of pending) send(server, messageFrame(message));
     await this.#scheduleCleanup();
-    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  #refuse(socket: WebSocket, result: Exclude<AuthResult, 'ok'>) {
+    const message =
+      result === 'required'
+        ? 'relay_auth_required: this channel requires an auth token'
+        : 'relay_auth_failed: auth token does not match this channel';
+    socket.serializeAttachment({ ...(socket.deserializeAttachment() as Attachment), replaced: true });
+    send(socket, { type: 'error', message });
+    try {
+      socket.close(1008, result === 'required' ? 'relay_auth_required' : 'relay_auth_failed');
+    } catch {}
+  }
+
+  /** Checks a token against this channel, claiming an unclaimed legacy id. */
+  #authenticate(id: string, token: Uint8Array | null): AuthResult {
+    if (id.startsWith(CHANNEL_ID_PREFIX)) {
+      if (!token) return 'required';
+      return constantTimeEqual(channelId(token), id) ? 'ok' : 'failed';
+    }
+    const [claim] = this.#sql.exec<{ verifier: string }>('SELECT verifier FROM channel_auth WHERE id = 1').toArray();
+    if (claim) {
+      if (!token) return 'required';
+      if (!constantTimeEqual(verifier(id, token), claim.verifier)) return 'failed';
+      this.#sql.exec('UPDATE channel_auth SET last_seen_at = ? WHERE id = 1', now());
+      return 'ok';
+    }
+    if (token) {
+      this.#sql.exec(
+        'INSERT INTO channel_auth (id, verifier, last_seen_at) VALUES (1, ?, ?)',
+        verifier(id, token),
+        now(),
+      );
+      return 'ok';
+    }
+    return this.env.REQUIRE_AUTH === 'true' ? 'required' : 'ok';
+  }
+
+  /**
+   * `/push` gate: the caller must hold this channel's token (an unclaimed
+   * legacy channel cannot push), within a per-channel hourly budget.
+   */
+  async #pushAuth(request: Request): Promise<Response> {
+    const { id, token } = (await request.json()) as { id: string; token: string };
+    const decoded = decodeToken(token);
+    const unclaimed =
+      !id.startsWith(CHANNEL_ID_PREFIX) && this.#sql.exec('SELECT 1 FROM channel_auth WHERE id = 1').toArray().length === 0;
+    if (!decoded || unclaimed || this.#authenticate(id, decoded) !== 'ok') {
+      return new Response('push requires the channel auth token', { status: 401 });
+    }
+    const budget = Number(this.env.PUSH_PER_HOUR ?? '120');
+    const hour = Math.floor(now() / 3600);
+    const { count } = this.#sql
+      .exec<{ count: number }>(
+        `INSERT INTO push_budget (id, hour, count) VALUES (1, ?, 1)
+         ON CONFLICT (id) DO UPDATE SET
+           count = CASE WHEN push_budget.hour = excluded.hour THEN push_budget.count + 1 ELSE 1 END,
+           hour = excluded.hour
+         RETURNING count`,
+        hour,
+      )
+      .one();
+    if (Number.isFinite(budget) && budget > 0 && count > budget) {
+      return new Response('push budget exceeded for this channel', { status: 429 });
+    }
+    return new Response('OK');
   }
 
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer) {
     const attachment = socket.deserializeAttachment() as Attachment;
     if (attachment.replaced) return;
+    if (attachment.awaitingAuth) {
+      let token: Uint8Array | null = null;
+      if (typeof message === 'string' && byteLength(message) <= 1024) {
+        try {
+          const frame = parseClientFrame(message);
+          if (frame.type === 'auth') token = decodeToken(frame.token);
+        } catch {}
+      }
+      const result = token ? this.#authenticate(attachment.awaitingAuth.id, token) : 'failed';
+      if (result !== 'ok') {
+        this.#refuse(socket, result);
+        return;
+      }
+      await this.#admit(socket, attachment.endpoint, attachment.deviceId, attachment.awaitingAuth.ackHead);
+      return;
+    }
     const size = typeof message === 'string' ? byteLength(message) : message.byteLength;
     if (size > MAX_MESSAGE_BYTES) {
       socket.close(CLOSE_MESSAGE_TOO_BIG, 'Message too big');
@@ -257,6 +412,11 @@ export class Channel extends DurableObject<Env> {
       frame = parseClientFrame(message);
     } catch (error) {
       send(socket, { type: 'error', message: `invalid frame: ${(error as Error).message}` });
+      return;
+    }
+
+    if (frame.type === 'auth') {
+      send(socket, { type: 'error', message: 'invalid frame: auth is only valid as the first frame' });
       return;
     }
 
@@ -325,15 +485,20 @@ export class Channel extends DurableObject<Env> {
       this.#sql.exec('DELETE FROM pending WHERE created_at < ?', pendingCutoff);
       this.#sql.exec('DELETE FROM receipts WHERE created_at < ?', time - this.#limits.receiptRetention);
       this.#sql.exec('DELETE FROM devices WHERE last_seen_at < ?', time - this.#limits.deviceRetention);
+      // A claim lapses with its devices, so abandoned ids do not pin storage.
+      this.#sql.exec('DELETE FROM channel_auth WHERE last_seen_at < ?', time - this.#limits.deviceRetention);
     });
     await this.#scheduleCleanup();
   }
 
-  /** Live, non-replaced sockets of an endpoint, optionally only one device. */
+  /** Live, admitted sockets of an endpoint, optionally only one device. */
   #live(endpoint: Endpoint, deviceId?: string): WebSocket[] {
     return this.ctx
       .getWebSockets(deviceId === undefined ? endpoint : `${endpoint}:${deviceId}`)
-      .filter((socket) => !(socket.deserializeAttachment() as Attachment).replaced);
+      .filter((socket) => {
+        const attachment = socket.deserializeAttachment() as Attachment;
+        return !attachment.replaced && !attachment.awaitingAuth;
+      });
   }
 
   /** Forwards to the peer endpoint's live devices without storage; the sender only hears back when none took it. */
@@ -558,9 +723,11 @@ export class Channel extends DurableObject<Env> {
         `SELECT MIN(due) AS due FROM (
           SELECT MIN(created_at) + ? AS due FROM pending
           UNION ALL SELECT MIN(created_at) + ? FROM receipts
-          UNION ALL SELECT MIN(last_seen_at) + ? FROM devices)`,
+          UNION ALL SELECT MIN(last_seen_at) + ? FROM devices
+          UNION ALL SELECT MIN(last_seen_at) + ? FROM channel_auth)`,
         this.#limits.pendingRetention,
         this.#limits.receiptRetention,
+        this.#limits.deviceRetention,
         this.#limits.deviceRetention,
       )
       .one();

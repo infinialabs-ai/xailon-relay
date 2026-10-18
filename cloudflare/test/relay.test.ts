@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
+import { channelId, encodeAuthToken } from '../../client-ts/src/relay-client.ts';
 import {
   LOCAL_MAX_PENDING_MESSAGES,
+  LOCAL_PUSH_PER_HOUR,
   type Relay,
   createClient,
   rawSocket,
@@ -281,10 +283,104 @@ test('queue_full rejects messages beyond the pending limit', async (t) => {
   sender.socket.close();
 });
 
-test('push answers 503 until FCM is configured, and validates its body', async (t) => {
-  const response = await fetch(`${relay.httpUrl}/push`, { method: 'POST', body: '{}' });
+test('push validates its body, then answers 503 until FCM is configured', async (t) => {
+  const post = (body: string) => fetch(`${relay.httpUrl}/push`, { method: 'POST', body });
+  assert.equal((await post('{}')).status, 400);
+  assert.equal((await post('not json')).status, 400);
+  const token = crypto.getRandomValues(new Uint8Array(32));
+  const notifications = [{ tokens: ['fcm-token'], data: { agent: 'a', sessionId: 's' } }];
+  const response = await post(JSON.stringify({ notifications, id: await channelId(token), auth: encodeAuthToken(token) }));
   if (relay.live && response.status !== 503) return t.skip('push is configured on this relay');
   assert.equal(response.status, 503);
   assert.match((await response.json()).error, /FCM_SERVICE_ACCOUNT/);
   assert.equal((await fetch(`${relay.httpUrl}/push`)).status, 405);
+});
+
+const randomToken = () => crypto.getRandomValues(new Uint8Array(32));
+
+/** Opens a raw socket that sends `token` as its first frame. */
+const authedSocket = async (id: string, endpoint: '1' | '2', deviceId: string, token?: Uint8Array) => {
+  const url = new URL(relay.wsUrl);
+  url.search = new URLSearchParams({ id, endpoint, device_id: deviceId, ...(token ? { auth: '1' } : {}) }).toString();
+  const socket = new WebSocket(url);
+  const frames: Record<string, unknown>[] = [];
+  let closed = false;
+  socket.addEventListener('open', () => {
+    if (token) socket.send(JSON.stringify({ type: 'auth', token: encodeAuthToken(token) }));
+  });
+  socket.addEventListener('message', (event) => frames.push(JSON.parse(event.data as string)));
+  socket.addEventListener('close', () => {
+    closed = true;
+  });
+  await waitFor(() => frames.length > 0 || closed, 'first frame');
+  return { socket, frames, closed: () => closed };
+};
+
+test('self-certifying channels admit only the token holder', async () => {
+  const token = randomToken();
+  const id = await channelId(token);
+  const host = createClient(relay, { relayId: id, endpoint: '1', deviceId: 'host', authToken: token });
+  const phone = createClient(relay, { relayId: id, endpoint: '2', deviceId: 'phone', authToken: token });
+  await host.client.connect();
+  await phone.client.connect();
+  await host.connected();
+  await phone.connected();
+  await host.client.send({ secret: 'ok' });
+  await waitFor(() => phone.payloads.length === 1, 'authenticated delivery');
+
+  // Knowing the id alone cannot preempt the host or purge its backlog.
+  const bare = await authedSocket(id, '1', 'host');
+  assert.match(String(bare.frames[0]?.message), /^relay_auth_required/);
+  const wrong = await authedSocket(id, '1', 'host', randomToken());
+  assert.match(String(wrong.frames[0]?.message), /^relay_auth_failed/);
+  await waitFor(() => wrong.closed(), 'refused socket closes');
+  await sleep(300);
+  assert.equal(host.states.at(-1), 'connected', 'the host was not preempted');
+  await phone.client.send({ still: 'connected' });
+  await waitFor(() => host.payloads.length === 1, 'host still receives');
+  host.client.close();
+  phone.client.close();
+});
+
+test('the first authenticated connection claims a legacy id', async () => {
+  const id = relayId('claim');
+  const legacy = await authedSocket(id, '2', 'old');
+  assert.equal(legacy.frames[0]?.type, 'ready', 'unclaimed ids stay open');
+  legacy.socket.close();
+
+  const token = randomToken();
+  const owner = await authedSocket(id, '1', 'host', token);
+  assert.equal(owner.frames[0]?.type, 'ready');
+  const bare = await authedSocket(id, '2', 'phone');
+  assert.match(String(bare.frames[0]?.message), /^relay_auth_required/);
+  const wrong = await authedSocket(id, '2', 'phone', randomToken());
+  assert.match(String(wrong.frames[0]?.message), /^relay_auth_failed/);
+  const phone = await authedSocket(id, '2', 'phone', token);
+  assert.equal(phone.frames[0]?.type, 'ready');
+  owner.socket.close();
+  phone.socket.close();
+});
+
+test('push requires the channel token and has a per-channel budget', async () => {
+  const push = (body: unknown) =>
+    fetch(`${relay.httpUrl}/push`, { method: 'POST', body: JSON.stringify(body) });
+  const notifications = [{ tokens: ['fcm-token'], data: { agent: 'a', sessionId: 's' } }];
+  const token = randomToken();
+  const id = await channelId(token);
+
+  assert.equal((await push({ notifications })).status, 401, 'no channel auth');
+  assert.equal((await push({ notifications, id, auth: encodeAuthToken(randomToken()) })).status, 401, 'wrong token');
+  const unclaimed = relayId('push');
+  assert.equal(
+    (await push({ notifications, id: unclaimed, auth: encodeAuthToken(token) })).status,
+    401,
+    'an unclaimed legacy channel cannot push',
+  );
+  // Past the gate the local relay has no FCM credentials, so 503 means "authorized".
+  for (let n = 0; n < LOCAL_PUSH_PER_HOUR; n++) {
+    assert.equal((await push({ notifications, id, auth: encodeAuthToken(token) })).status, 503);
+  }
+  assert.equal((await push({ notifications, id, auth: encodeAuthToken(token) })).status, 429, 'budget');
+  const tooMany = [{ tokens: Array.from({ length: 11 }, (_, n) => `t${n}`), data: { agent: 'a', sessionId: 's' } }];
+  assert.equal((await push({ notifications: tooMany, id, auth: encodeAuthToken(token) })).status, 400);
 });

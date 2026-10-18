@@ -1,3 +1,4 @@
+import { decodeToken } from './channel';
 import type { Env } from './index';
 
 /**
@@ -8,9 +9,13 @@ import type { Env } from './index';
  * from a fixed template, so the endpoint cannot be used to send arbitrary
  * content. Messages go out through FCM HTTP v1 (Android directly, iOS through
  * FCM's APNs bridge).
+ *
+ * The caller proves it is paired: the body names its relay channel (`id`) and
+ * carries the channel auth token (`auth`), checked by that channel's Durable
+ * Object, which also enforces a per-channel hourly budget.
  */
 
-const MAX_TOKENS = 20;
+const MAX_TOKENS = 10;
 const MAX_FIELD_BYTES = 4096;
 const BODY_LOC_KEY = 'notification_response_complete';
 const TITLE = 'XailonOrbit';
@@ -108,16 +113,28 @@ const accessToken = async (account: ServiceAccount) => {
 };
 
 export const forwardPush = async (request: Request, env: Env): Promise<Response> => {
+  let body: { id?: unknown; auth?: unknown };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json({ error: 'body must be JSON' }, 400);
+  }
+  const pushes = parsePushes(body);
+  if (typeof pushes === 'string') return json({ error: pushes }, 400);
+
+  const { id, auth } = body ?? {};
+  if (typeof id === 'string' && id && new TextEncoder().encode(id).length <= 256 && decodeToken(auth)) {
+    const gate = await env.CHANNEL.get(env.CHANNEL.idFromName(id)).fetch('https://channel/push-auth', {
+      method: 'POST',
+      body: JSON.stringify({ id, token: auth }),
+    });
+    if (!gate.ok) return json({ error: await gate.text() }, gate.status);
+  } else if (env.ALLOW_UNAUTHENTICATED_PUSH !== 'true') {
+    return json({ error: 'push requires the channel id and auth token' }, 401);
+  }
   if (!env.FCM_SERVICE_ACCOUNT) {
     return json({ error: 'Push forwarding is not configured: set the FCM_SERVICE_ACCOUNT secret' }, 503);
   }
-  let pushes: Push[] | string;
-  try {
-    pushes = parsePushes(await request.json());
-  } catch {
-    pushes = 'body must be JSON';
-  }
-  if (typeof pushes === 'string') return json({ error: pushes }, 400);
 
   const account = JSON.parse(env.FCM_SERVICE_ACCOUNT) as ServiceAccount;
   const token = await accessToken(account);

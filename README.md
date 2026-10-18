@@ -31,13 +31,15 @@ variable:
 | `--receipt-retention-secs` | `RELAY_RECEIPT_RETENTION_SECS` | `3600` (1 hour) |
 | `--device-retention-secs` | `RELAY_DEVICE_RETENTION_SECS` | `604800` (7 days) |
 | `--cleanup-interval-secs` | `RELAY_CLEANUP_INTERVAL_SECS` | `600` (10 minutes) |
+| `--require-auth` | `RELAY_REQUIRE_AUTH` | off: unclaimed channels accept unauthenticated clients |
+| `--max-connections-per-minute` | `RELAY_MAX_CONNECTIONS_PER_MINUTE` | `120` per client IP (`0` disables) |
+| `--client-ip-header` | `RELAY_CLIENT_IP_HEADER` | unset: the TCP peer address (set e.g. `X-Forwarded-For` behind a trusted proxy) |
 
-Debug logging records connection and disconnection details, pairing ids,
-endpoints, message ids, JSON payloads, acknowledgements, and replay/forwarding
-outcomes. Because pairing ids are credentials and payloads may be sensitive, do
-not enable it in production unless the resulting logs are protected. Release
-builds can enable it with `--debug` or `RELAY_DEBUG=true`; `RUST_LOG` can be used
-to override the log filter.
+Debug logging records connections, endpoints, message ids, acknowledgements,
+and replay/forwarding outcomes. Channel and device ids appear only as short
+SHA-256 labels, and payloads are never logged. Release builds can enable it
+with `--debug` or `RELAY_DEBUG=true`; `RUST_LOG` can be used to override the
+log filter.
 
 For an internet-facing deployment, terminate TLS in a reverse proxy and expose
 the WebSocket endpoint over `wss://`.
@@ -63,9 +65,18 @@ contract and error strings, so `client-ts` and `client-rs` work unchanged.
   nothing. Expiry runs from a Durable Object alarm set for the next due
   pending message, receipt or device, instead of a fixed cleanup interval.
 - `POST /push` forwards xailon-orbitd completion notifications to Firebase
-  Cloud Messaging (HTTP v1). Only the device tokens and agent/session ids are
-  taken from the request; the notification is built from a fixed template.
-  Without the `FCM_SERVICE_ACCOUNT` secret it answers `503`.
+  Cloud Messaging (HTTP v1). The body must name the caller's channel (`id`)
+  and carry its auth token (`auth`, see [Channel auth](#channel-auth)); the
+  channel's Durable Object checks the token and a per-channel hourly budget
+  (`PUSH_PER_HOUR`, default 120). At most 10 device tokens per request. Only
+  the device tokens and agent/session ids are taken from the request; the
+  notification is built from a fixed template. Without the
+  `FCM_SERVICE_ACCOUNT` secret it answers `503`. `ALLOW_UNAUTHENTICATED_PUSH`
+  set to `"true"` restores the old unauthenticated behavior for daemons that
+  predate channel auth.
+- New connections (120 per minute) and pushes (30 per minute) are rate-limited
+  per client IP with Workers Rate Limiting bindings (`ratelimits` in
+  `wrangler.jsonc`).
 - `GET /health` returns `200 OK`.
 
 **Deploy to your own Cloudflare account** (the Free plan is enough: SQLite
@@ -102,9 +113,11 @@ Admin* role, download its JSON key, and store it as a secret:
 npx wrangler secret put FCM_SERVICE_ACCOUNT < service-account.json
 ```
 
-Limits are Worker variables in `wrangler.jsonc` with the same defaults as the
-Rust server: `MAX_PENDING_MESSAGES`, `MAX_PENDING_BYTES`,
-`PENDING_RETENTION_SECS`, `RECEIPT_RETENTION_SECS`, `DEVICE_RETENTION_SECS`.
+Limits are Worker variables in `wrangler.jsonc`: `MAX_PENDING_MESSAGES`,
+`MAX_PENDING_BYTES` (64 MiB per channel and direction on the hosted
+instance, 1 GiB in the Rust server), `PENDING_RETENTION_SECS`,
+`RECEIPT_RETENTION_SECS`, `DEVICE_RETENTION_SECS`, `PUSH_PER_HOUR`, and
+`REQUIRE_AUTH` (see [Channel auth](#channel-auth)).
 
 **Tests** start `wrangler dev` and drive the real `client-ts` end to end:
 
@@ -157,6 +170,7 @@ Query parameters for `/ws`:
 - `endpoint`: `1` or `2`. Messages sent from 1 are forwarded to 2, and vice versa.
 - `device_id`: Unique stable identifier for this device (non-empty string, max 256 bytes).
 - `ack_head`: Optional boolean (`true` / `1`). When set on connect, resets this endpoint's receive cursor to the latest head sequence, immediately acknowledging and purging unread server backlog so the device only receives subsequent live messages.
+- `auth`: Optional boolean (`1`). The first frame is a channel auth token; see [Channel auth](#channel-auth).
 
 Messages are isolated by pairing id and forwarded to the opposite endpoint with
 the same id:
@@ -177,9 +191,38 @@ the same id:
   a `connection_replaced` error frame, allowing mobile clients switching networks
   (e.g. WiFi to 5G) to resume immediately without waiting for half-open idle timeouts.
 
-The pairing id is the channel's access credential. Generate it with sufficient
-entropy, keep it secret, and avoid recording WebSocket query strings in proxy
-access logs.
+## Channel auth
+
+A channel id travels in the connect URL, where proxies and access logs can see
+it, so on its own it is a weak credential: anyone who learns it could preempt
+a device or purge its backlog with `ack_head`. Clients should therefore
+authenticate with a 32-byte **channel auth token** derived from a secret both
+endpoints share (for example the pairing secret, through HKDF with a distinct
+label). The token is never put in the URL:
+
+1. Connect with `auth=1` in the query.
+2. Send `{"type":"auth","token":"<base64url, no padding>"}` as the first frame.
+3. The relay answers `ready` on success. Otherwise it sends
+   `relay_auth_failed: …` or `relay_auth_required: …` and closes, before the
+   connection can register, preempt another socket, or acknowledge anything.
+
+How the relay checks a token depends on the id:
+
+- **Self-certifying ids** (recommended): `xrc1_` +
+  base64url(SHA-256("xailon-relay/channel/v1" ‖ 0x00 ‖ token)). The id is a hash
+  of the token, so the relay verifies it without storing anything, and nobody
+  can claim the channel without the token. `relay_client::auth::channel_id` and
+  `channelId` in `client-ts` compute it.
+- **Other ids** are claimed by their first authenticated connection. The relay
+  stores only a SHA-256 verifier of the token bound to the id, and refuses
+  every later connection without that token. A claim lapses after
+  `--device-retention-secs` without an authenticated connection.
+- **Unclaimed ids** keep accepting unauthenticated clients, so existing
+  deployments keep working. Start the relay with `--require-auth` (Worker:
+  `REQUIRE_AUTH="true"`) to refuse them once all clients authenticate.
+
+Rust: `Client::new(url, store, handler).with_auth_token(token)`.
+TypeScript: `new RelayClient({ ..., relayId: await channelId(token), authToken: token })`.
 
 ## Health Check
 
@@ -211,6 +254,7 @@ Client to server:
 {"type":"message","message_id":"stable-client-generated-id","payload":{"any":"json"},"target_device_id":"phone_a"}
 {"type":"message","message_id":"client-generated-id","payload":{"any":"json"},"ephemeral":true}
 {"type":"ack","sequence":42}
+{"type":"auth","token":"base64url-32-byte-token"}
 ```
 
 Server to client:
