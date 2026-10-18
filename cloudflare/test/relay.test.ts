@@ -331,6 +331,7 @@ test('self-certifying channels admit only the token holder', async () => {
   // Knowing the id alone cannot preempt the host or purge its backlog.
   const bare = await authedSocket(id, '1', 'host');
   assert.match(String(bare.frames[0]?.message), /^relay_auth_required/);
+  await waitFor(() => bare.closed(), 'refused socket closes');
   const wrong = await authedSocket(id, '1', 'host', randomToken());
   assert.match(String(wrong.frames[0]?.message), /^relay_auth_failed/);
   await waitFor(() => wrong.closed(), 'refused socket closes');

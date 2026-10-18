@@ -258,6 +258,15 @@ export class Channel extends DurableObject<Env> {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
+    const result = query.auth ? 'ok' : this.#authenticate(query.id, null);
+    if (result !== 'ok') {
+      // Refused before hibernation: a plain accepted socket delivers the
+      // error and the close once the handshake completes.
+      server.accept();
+      server.serializeAttachment({ endpoint, deviceId } satisfies Attachment);
+      this.#refuse(server, result);
+      return new Response(null, { status: 101, webSocket: client });
+    }
     this.ctx.acceptWebSocket(server, [endpoint, `${endpoint}:${deviceId}`]);
     // Admitted only once authenticated: until then the socket gets nothing
     // and changes nothing about the channel.
@@ -266,10 +275,7 @@ export class Channel extends DurableObject<Env> {
       deviceId,
       awaitingAuth: { id: query.id, ackHead: query.ackHead },
     } satisfies Attachment);
-    if (query.auth) return new Response(null, { status: 101, webSocket: client });
-    const result = this.#authenticate(query.id, null);
-    if (result === 'ok') await this.#admit(server, endpoint, deviceId, query.ackHead);
-    else this.#refuse(server, result);
+    if (!query.auth) await this.#admit(server, endpoint, deviceId, query.ackHead);
     return new Response(null, { status: 101, webSocket: client });
   }
 
