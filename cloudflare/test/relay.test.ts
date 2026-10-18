@@ -377,6 +377,11 @@ test('push requires the channel token and has a per-channel budget', async () =>
     401,
     'an unclaimed legacy channel cannot push',
   );
+  if (relay.live) {
+    // A deployed relay may have FCM configured and keeps its production budget.
+    assert.notEqual((await push({ notifications, id, auth: encodeAuthToken(token) })).status, 401, 'authorized');
+    return;
+  }
   // Past the gate the local relay has no FCM credentials, so 503 means "authorized".
   for (let n = 0; n < LOCAL_PUSH_PER_HOUR; n++) {
     assert.equal((await push({ notifications, id, auth: encodeAuthToken(token) })).status, 503);
