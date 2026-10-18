@@ -40,7 +40,8 @@ export type ServerFrame =
 
 export type ClientFrame =
   | { type: 'message'; message_id: string; payload: unknown; target_device_id?: string; ephemeral?: boolean }
-  | { type: 'ack'; sequence: number };
+  | { type: 'ack'; sequence: number }
+  | { type: 'auth'; token: string };
 
 /** Persistence for outbound messages and the receive cursor. */
 export type RelayStore = {
@@ -69,6 +70,12 @@ export type RelayClientOptions = {
    * Subsequent automatic reconnects will not send ack_head, preserving missed message replay.
    */
   ackHead?: boolean;
+  /**
+   * 32-byte channel auth token, sent as the first frame of every connection (never in the URL).
+   * The relay then refuses connections to this channel without it. Derive it from a secret both
+   * endpoints share; use `channelId(token)` as `relayId` for a self-certifying channel.
+   */
+  authToken?: Uint8Array;
   /** Receives durable payloads in sequence order, and ephemeral text payloads. */
   onPayload: (payload: unknown) => void | Promise<void>;
   /** Receives ephemeral binary messages. */
@@ -106,6 +113,28 @@ export const isNewSequence = (lastReceived: number | undefined, sequence: number
   }
   return true;
 };
+
+const base64url = (bytes: Uint8Array) =>
+  btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+/** Prefix of self-certifying channel ids. */
+export const CHANNEL_ID_PREFIX = 'xrc1_';
+
+/**
+ * Self-certifying channel id for an auth token:
+ * `xrc1_` + base64url(SHA-256("xailon-relay/channel/v1" || 0x00 || token)).
+ */
+export const channelId = async (token: Uint8Array): Promise<string> => {
+  if (token.length !== 32) throw new Error('Relay auth token must be 32 bytes');
+  const label = new TextEncoder().encode('xailon-relay/channel/v1\0');
+  const input = new Uint8Array(label.length + 32);
+  input.set(label);
+  input.set(token, label.length);
+  return CHANNEL_ID_PREFIX + base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', input)));
+};
+
+/** Wire form of an auth token: base64url without padding. */
+export const encodeAuthToken = (token: Uint8Array): string => base64url(token);
 
 export type BinaryHeader = { message_id: string; target_device_id?: string };
 
@@ -197,6 +226,7 @@ export class RelayClient {
   #deviceId?: string;
   #relayUrl: string;
   #ackHead: boolean;
+  #authToken?: string;
   #store: RelayStore;
   #onPayload: RelayClientOptions['onPayload'];
   #onBinary?: RelayClientOptions['onBinary'];
@@ -229,6 +259,7 @@ export class RelayClient {
     deviceId,
     relayUrl,
     ackHead,
+    authToken,
     onPayload,
     onBinary,
     onUndeliverable,
@@ -247,6 +278,10 @@ export class RelayClient {
     this.#deviceId = deviceId;
     this.#relayUrl = relayUrl;
     this.#ackHead = ackHead ?? false;
+    if (authToken) {
+      if (authToken.length !== 32) throw new Error('Relay auth token must be 32 bytes');
+      this.#authToken = encodeAuthToken(authToken);
+    }
     this.#store = store ?? localStorageStore(relayId, storageKey);
     this.#onPayload = onPayload;
     this.#onBinary = onBinary;
@@ -281,6 +316,9 @@ export class RelayClient {
     url.searchParams.set('device_id', this.#deviceId);
     if (this.#ackHead) {
       url.searchParams.set('ack_head', 'true');
+    }
+    if (this.#authToken) {
+      url.searchParams.set('auth', '1');
     }
     const socket = new WebSocket(url);
     socket.binaryType = 'arraybuffer';
@@ -347,6 +385,9 @@ export class RelayClient {
     this.#ackHead = false;
     this.#relayReady = false;
     this.#sent.clear();
+    if (this.#authToken) {
+      this.#socket?.send(JSON.stringify({ type: 'auth', token: this.#authToken } satisfies ClientFrame));
+    }
   };
 
   #handleMessage = (event: MessageEvent<string | ArrayBuffer>) => {

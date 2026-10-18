@@ -19,6 +19,7 @@
 //! The WebSocket transport lives in [`transport`]; [`Client::run`] drives it
 //! until stopped.
 
+pub mod auth;
 pub mod store;
 pub mod transport;
 
@@ -66,6 +67,8 @@ pub trait ClientHandler: Send + Sync + 'static {
 pub struct Client<S, H> {
     url: Arc<String>,
     ack_head: Arc<std::sync::atomic::AtomicBool>,
+    /// Channel auth token, sent as the first frame of every connection.
+    auth_token: Option<Arc<[u8; 32]>>,
     store: Arc<S>,
     handler: Arc<H>,
     notify_send: Arc<tokio::sync::Notify>,
@@ -80,6 +83,7 @@ impl<S, H> Clone for Client<S, H> {
         Self {
             url: self.url.clone(),
             ack_head: self.ack_head.clone(),
+            auth_token: self.auth_token.clone(),
             store: self.store.clone(),
             handler: self.handler.clone(),
             notify_send: self.notify_send.clone(),
@@ -112,6 +116,7 @@ where
         Self {
             url: Arc::new(url),
             ack_head: Arc::new(std::sync::atomic::AtomicBool::new(ack_head)),
+            auth_token: None,
             store,
             handler,
             notify_send: Arc::new(tokio::sync::Notify::new()),
@@ -119,6 +124,14 @@ where
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live: Arc::default(),
         }
+    }
+
+    /// Authenticates every connection with a channel auth token; see
+    /// [`auth`]. The relay then refuses connections to this channel that do
+    /// not hold the token.
+    pub fn with_auth_token(mut self, token: [u8; 32]) -> Self {
+        self.auth_token = Some(Arc::new(token));
+        self
     }
 
     /// Signals the client to stop running and disconnect cleanly.
@@ -264,12 +277,22 @@ where
 
     async fn run_connection(&self, was_connected: &mut bool) -> anyhow::Result<()> {
         let should_ack_head = self.ack_head.load(std::sync::atomic::Ordering::Relaxed);
-        let connect_url = if should_ack_head {
+        let mut connect_url = if should_ack_head {
             transport::append_ack_head(&self.url)
         } else {
             self.url.as_str().to_string()
         };
+        if self.auth_token.is_some() {
+            connect_url = transport::append_auth(&connect_url);
+        }
         let mut transport = transport::connect(&connect_url).await?;
+        if let Some(token) = &self.auth_token {
+            transport
+                .send_frame(&relay_frame::ClientFrame::Auth {
+                    token: auth::encode_token(token),
+                })
+                .await?;
+        }
         self.ack_head.store(false, std::sync::atomic::Ordering::Relaxed);
 
         let mut sent = std::collections::HashSet::new();
@@ -405,6 +428,11 @@ pub mod relay_frame {
         /// Cumulative acknowledgement for all received sequences up to this one.
         Ack {
             sequence: u64,
+        },
+        /// Channel auth token (base64url, no padding). Sent first, and only
+        /// on connections opened with `auth=1`.
+        Auth {
+            token: String,
         },
     }
 

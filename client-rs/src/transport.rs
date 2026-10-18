@@ -76,10 +76,19 @@ pub fn append_ack_head(url: &str) -> String {
     }
 }
 
+/// Appends `auth=1`, announcing that the first frame is a channel auth token.
+pub fn append_auth(url: &str) -> String {
+    if url.contains('?') {
+        format!("{url}&auth=1")
+    } else {
+        format!("{url}?auth=1")
+    }
+}
+
 pub async fn connect(url: &str) -> Result<Transport> {
     let (socket, _) = connect_async(url)
         .await
-        .with_context(|| format!("failed to connect to relay at {url}"))?;
+        .with_context(|| format!("failed to connect to relay at {}", redact_url(url)))?;
     let (mut sink, stream) = socket.split();
     // Pings and data frames share one sink, so a single task owns it and
     // receives both ping ticks and outbound frames from a channel.
@@ -109,6 +118,11 @@ pub async fn connect(url: &str) -> Result<Transport> {
         stream,
         ping_task,
     })
+}
+
+/// The connect URL without its query, which carries the channel id.
+fn redact_url(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
 }
 
 /// A connected relay socket. Dropping it aborts the ping task and closes the
