@@ -10,6 +10,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }

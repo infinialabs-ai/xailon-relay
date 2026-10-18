@@ -224,7 +224,7 @@ async fn isolates_pairs_and_replays_after_disconnect_and_server_restart() {
 }
 
 #[tokio::test]
-async fn debug_logs_connections_messages_and_disconnects() {
+async fn debug_logs_connections_and_messages_without_ids_or_payloads() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("relay.sqlite3");
     let port = TcpListener::bind("127.0.0.1:0")
@@ -258,9 +258,15 @@ async fn debug_logs_connections_messages_and_disconnects() {
 
     let logs = server.stop_and_collect_stderr();
     assert!(logs.contains("WebSocket endpoint connected"), "{logs}");
-    assert!(logs.contains("relay_id=logged-pair"), "{logs}");
+    assert!(
+        logs.contains(&format!("relay={}", relay::auth::log_label("logged-pair"))),
+        "{logs}"
+    );
     assert!(logs.contains("message_id=logged-message"), "{logs}");
-    assert!(logs.contains("payload={\"hello\":\"logs\"}"), "{logs}");
+    // Channel and device ids can be credentials, and payloads are private.
+    assert!(!logs.contains("logged-pair"), "{logs}");
+    assert!(!logs.contains("dev-1"), "{logs}");
+    assert!(!logs.contains("hello"), "{logs}");
     assert!(logs.contains("WebSocket endpoint disconnected"), "{logs}");
 }
 
@@ -316,7 +322,8 @@ async fn ack_head_purges_stale_messages_on_connect() {
     );
 
     // Endpoint::Two connects cold with ack_head=true
-    let url = format!("ws://127.0.0.1:{port}/ws?id=pair-ack&endpoint=2&device_id=dev-2&ack_head=true");
+    let url =
+        format!("ws://127.0.0.1:{port}/ws?id=pair-ack&endpoint=2&device_id=dev-2&ack_head=true");
     let (mut ep2, _) = connect_async(&url).await.unwrap();
     expect_ready(&mut ep2, Endpoint::Two).await;
 
@@ -349,4 +356,3 @@ async fn ack_head_purges_stale_messages_on_connect() {
         }
     );
 }
-

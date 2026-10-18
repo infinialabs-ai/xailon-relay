@@ -99,20 +99,11 @@ where
     S: OutboxStore,
     H: ClientHandler,
 {
-    pub fn new(
-        url: String,
-        store: Arc<S>,
-        handler: Arc<H>,
-    ) -> Self {
+    pub fn new(url: String, store: Arc<S>, handler: Arc<H>) -> Self {
         Self::new_with_ack_head(url, false, store, handler)
     }
 
-    pub fn new_with_ack_head(
-        url: String,
-        ack_head: bool,
-        store: Arc<S>,
-        handler: Arc<H>,
-    ) -> Self {
+    pub fn new_with_ack_head(url: String, ack_head: bool, store: Arc<S>, handler: Arc<H>) -> Self {
         Self {
             url: Arc::new(url),
             ack_head: Arc::new(std::sync::atomic::AtomicBool::new(ack_head)),
@@ -136,7 +127,8 @@ where
 
     /// Signals the client to stop running and disconnect cleanly.
     pub fn close(&self) {
-        self.is_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.is_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.shutdown.notify_waiters();
     }
 
@@ -153,7 +145,10 @@ where
         payload: Value,
         target_device_id: Option<String>,
     ) -> anyhow::Result<String> {
-        let message_id = self.store.enqueue_targeted(payload, target_device_id).await?;
+        let message_id = self
+            .store
+            .enqueue_targeted(payload, target_device_id)
+            .await?;
         self.notify_send.notify_one();
         Ok(message_id)
     }
@@ -293,7 +288,8 @@ where
                 })
                 .await?;
         }
-        self.ack_head.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.ack_head
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let mut sent = std::collections::HashSet::new();
         let mut ready = false;
@@ -426,14 +422,10 @@ pub mod relay_frame {
             ephemeral: bool,
         },
         /// Cumulative acknowledgement for all received sequences up to this one.
-        Ack {
-            sequence: u64,
-        },
+        Ack { sequence: u64 },
         /// Channel auth token (base64url, no padding). Sent first, and only
         /// on connections opened with `auth=1`.
-        Auth {
-            token: String,
-        },
+        Auth { token: String },
     }
 
     #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -594,15 +586,16 @@ mod tests {
         let client = Client::new("ws://127.0.0.1:9".to_string(), store, handler);
 
         let c = client.clone();
-        let handle = tokio::spawn(async move {
-            c.run().await
-        });
+        let handle = tokio::spawn(async move { c.run().await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         client.close();
 
         let res = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
-        assert!(res.is_ok(), "client.run() should exit promptly after close()");
+        assert!(
+            res.is_ok(),
+            "client.run() should exit promptly after close()"
+        );
         assert!(res.unwrap().unwrap().is_ok());
     }
 
@@ -613,7 +606,10 @@ mod tests {
         let client = Client::new("ws://127.0.0.1:9".to_string(), store.clone(), handler);
 
         let msg_id = client
-            .send_targeted(serde_json::json!({ "test": 1 }), Some("phone_x".to_string()))
+            .send_targeted(
+                serde_json::json!({ "test": 1 }),
+                Some("phone_x".to_string()),
+            )
             .await
             .unwrap();
 
@@ -623,4 +619,3 @@ mod tests {
         assert_eq!(outbox[0].target_device_id, Some("phone_x".to_string()));
     }
 }
-

@@ -59,7 +59,9 @@ async fn connect(port: u16, id: &str, endpoint: &str, device_id: &str) -> Socket
     let url = url(port, id, endpoint, device_id);
     for _ in 0..100 {
         if let Ok((mut socket, _)) = tokio_tungstenite::connect_async(&url).await {
-            assert!(matches!(next(&mut socket).await, Some(Message::Text(text)) if text.contains("ready")));
+            assert!(
+                matches!(next(&mut socket).await, Some(Message::Text(text)) if text.contains("ready"))
+            );
             return socket;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -158,7 +160,9 @@ async fn binary_frames_are_forwarded_unchanged() {
         target_device_id: Some("phone".into()),
     };
     let frame = encode_binary_frame(&header, &body);
-    one.send(Message::Binary(frame.clone().into())).await.unwrap();
+    one.send(Message::Binary(frame.clone().into()))
+        .await
+        .unwrap();
 
     let Some(Message::Binary(received)) = next(&mut phone).await else {
         panic!("phone did not receive the binary frame");
@@ -170,10 +174,18 @@ async fn binary_frames_are_forwarded_unchanged() {
     assert!(next(&mut tablet).await.is_none());
 
     // A malformed binary frame is reported without dropping the connection.
-    one.send(Message::Binary(vec![0, 9, b'{'].into())).await.unwrap();
-    assert!(matches!(next_frame(&mut one).await, Some(ServerFrame::Error { .. })));
+    one.send(Message::Binary(vec![0, 9, b'{'].into()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_frame(&mut one).await,
+        Some(ServerFrame::Error { .. })
+    ));
     send(&mut one, &ephemeral("after", json!(1), Some("tablet"))).await;
-    assert!(matches!(next_frame(&mut tablet).await, Some(ServerFrame::Ephemeral { .. })));
+    assert!(matches!(
+        next_frame(&mut tablet).await,
+        Some(ServerFrame::Ephemeral { .. })
+    ));
 }
 
 #[derive(Default)]
@@ -221,7 +233,11 @@ async fn rust_client_sends_and_receives_ephemeral_messages() {
 
     let handler = Arc::new(Collect::default());
     let store = Arc::new(MemoryStore::new());
-    let client = Client::new(url(port, "pair-c", "1", "host"), store.clone(), handler.clone());
+    let client = Client::new(
+        url(port, "pair-c", "1", "host"),
+        store.clone(),
+        handler.clone(),
+    );
 
     // Ephemeral sends fail fast instead of queueing while disconnected.
     assert!(client.send_ephemeral(json!(0), None, None).await.is_err());
@@ -242,8 +258,14 @@ async fn rust_client_sends_and_receives_ephemeral_messages() {
     assert_eq!(header.message_id, message_id);
     assert_eq!(&received[body_start..], b"bytes");
 
-    client.send_ephemeral(json!({ "text": 1 }), None, None).await.unwrap();
-    assert!(matches!(next_frame(&mut peer).await, Some(ServerFrame::Ephemeral { .. })));
+    client
+        .send_ephemeral(json!({ "text": 1 }), None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_frame(&mut peer).await,
+        Some(ServerFrame::Ephemeral { .. })
+    ));
     assert!(store.outbox().await.is_empty());
 
     send(&mut peer, &ephemeral("from-peer", json!("hi"), None)).await;
@@ -251,9 +273,11 @@ async fn rust_client_sends_and_receives_ephemeral_messages() {
         message_id: "bin-from-peer".into(),
         target_device_id: None,
     };
-    peer.send(Message::Binary(encode_binary_frame(&header, b"\x00\x01").into()))
-        .await
-        .unwrap();
+    peer.send(Message::Binary(
+        encode_binary_frame(&header, b"\x00\x01").into(),
+    ))
+    .await
+    .unwrap();
     wait_until(
         || handler.binaries.lock().unwrap().len() == 1,
         "binary from peer",

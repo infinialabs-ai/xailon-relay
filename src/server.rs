@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -7,7 +12,7 @@ use axum::{
         ConnectInfo, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -20,13 +25,15 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     config::{Args, Limits},
-    database::{CleanupStats, Database, validate_message_id, validate_target_device_id},
+    database::{AuthError, CleanupStats, Database, validate_message_id, validate_target_device_id},
     hub::{ConnectionSender, Hub, connection_channel},
     keyed_lock::KeyedLock,
 };
 
 const MAX_ID_BYTES: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Time an `auth=1` connection has to send its auth frame.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct AppState {
@@ -35,6 +42,55 @@ struct AppState {
     limits: Limits,
     /// Fine-grained keyed locks per relay_id to eliminate cross-pairing contention.
     delivery: Arc<KeyedLock>,
+    require_auth: bool,
+    client_ip_header: Option<Arc<str>>,
+    connect_limit: Arc<RateLimiter>,
+}
+
+/// Fixed one-minute window of new connections per client IP.
+struct RateLimiter {
+    per_minute: u32,
+    windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl RateLimiter {
+    const WINDOW: Duration = Duration::from_secs(60);
+    const MAX_TRACKED: usize = 100_000;
+
+    fn new(per_minute: u32) -> Self {
+        Self {
+            per_minute,
+            windows: Mutex::default(),
+        }
+    }
+
+    fn allow(&self, ip: IpAddr) -> bool {
+        if self.per_minute == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let mut windows = self.windows.lock().expect("rate limiter lock poisoned");
+        if windows.len() >= Self::MAX_TRACKED {
+            windows.retain(|_, (start, _)| now.duration_since(*start) < Self::WINDOW);
+        }
+        let (start, count) = windows.entry(ip).or_insert((now, 0));
+        if now.duration_since(*start) >= Self::WINDOW {
+            *start = now;
+            *count = 0;
+        }
+        *count += 1;
+        *count <= self.per_minute
+    }
+}
+
+fn client_ip(headers: &HeaderMap, header: Option<&str>, peer_addr: SocketAddr) -> IpAddr {
+    header
+        .and_then(|name| headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        // X-Forwarded-For lists the original client first.
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(peer_addr.ip())
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +100,9 @@ struct ConnectQuery {
     device_id: String,
     #[serde(default, deserialize_with = "deserialize_optional_bool")]
     ack_head: bool,
+    /// The first frame is a channel auth token.
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    auth: bool,
 }
 
 fn deserialize_optional_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
@@ -83,9 +142,14 @@ where
 async fn websocket_handler(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Query(query): Query<ConnectQuery>,
     websocket: WebSocketUpgrade,
 ) -> Response {
+    let ip = client_ip(&headers, state.client_ip_header.as_deref(), peer_addr);
+    if !state.connect_limit.allow(ip) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many connections").into_response();
+    }
     if let Err(error) = validate_connection(&query) {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
@@ -98,7 +162,10 @@ fn validate_connection(query: &ConnectQuery) -> Result<()> {
     anyhow::ensure!(!query.id.is_empty(), "id must not be empty");
     anyhow::ensure!(query.id.len() <= MAX_ID_BYTES, "id is too long");
     anyhow::ensure!(!query.device_id.is_empty(), "device_id must not be empty");
-    anyhow::ensure!(query.device_id.len() <= MAX_ID_BYTES, "device_id is too long");
+    anyhow::ensure!(
+        query.device_id.len() <= MAX_ID_BYTES,
+        "device_id is too long"
+    );
     Ok(())
 }
 
@@ -108,11 +175,12 @@ async fn serve_socket(
     peer_addr: SocketAddr,
     socket: WebSocket,
 ) {
+    // Ids are credentials for unauthenticated channels; log only labels.
     let span = tracing::debug_span!(
         "websocket",
-        relay_id = %query.id,
+        relay = %relay::auth::log_label(&query.id),
         endpoint = %query.endpoint,
-        device_id = %query.device_id,
+        device = %relay::auth::log_label(&query.device_id),
         %peer_addr
     );
     serve_socket_inner(state, query, socket)
@@ -120,10 +188,73 @@ async fn serve_socket(
         .await;
 }
 
+/// Reads the auth frame that must open an `auth=1` connection.
+async fn read_auth_token(socket: &mut WebSocket) -> Option<[u8; 32]> {
+    let message = time::timeout(AUTH_TIMEOUT, socket.recv())
+        .await
+        .ok()??
+        .ok()?;
+    let Message::Text(text) = message else {
+        return None;
+    };
+    match serde_json::from_str::<ClientFrame>(&text).ok()? {
+        ClientFrame::Auth { token } => relay::auth::decode_token(&token),
+        _ => None,
+    }
+}
+
 async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: WebSocket) {
+    let auth_token = if query.auth {
+        match read_auth_token(&mut socket).await {
+            Some(token) => Some(token),
+            None => {
+                reject_socket(
+                    &mut socket,
+                    "relay_auth_failed: missing or invalid auth frame",
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let (tx, mut rx) = connection_channel();
     let (token, replayed) = {
         let _delivery = state.delivery.lock(&query.id).await;
+
+        // Authenticate before anything that changes the channel: device
+        // registration, preemption of another socket, or `ack_head`.
+        match state
+            .database
+            .authenticate(&query.id, auth_token.as_ref(), state.require_auth)
+            .await
+        {
+            Ok(()) => {}
+            Err(AuthError::Required) => {
+                debug!("connection rejected: channel requires auth");
+                reject_socket(
+                    &mut socket,
+                    "relay_auth_required: this channel requires an auth token",
+                )
+                .await;
+                return;
+            }
+            Err(AuthError::Failed) => {
+                debug!("connection rejected: wrong channel auth token");
+                reject_socket(
+                    &mut socket,
+                    "relay_auth_failed: auth token does not match this channel",
+                )
+                .await;
+                return;
+            }
+            Err(AuthError::Storage(error)) => {
+                error!(%error, "failed to check channel auth");
+                reject_socket(&mut socket, "relay_storage_unavailable: auth check failed").await;
+                return;
+            }
+        }
 
         if let Err(error) = state
             .database
@@ -184,7 +315,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
 
     debug!(
         replayed_messages = replayed,
-        device_id = %query.device_id,
+        authenticated = auth_token.is_some(),
         "WebSocket endpoint connected"
     );
 
@@ -254,7 +385,6 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                     Ok((header, body_start)) => {
                         debug!(
                             message_id = %header.message_id,
-                            target_device_id = ?header.target_device_id,
                             body_bytes = bytes.len() - body_start,
                             "binary message received"
                         );
@@ -298,7 +428,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                 target_device_id,
                 ephemeral: true,
             } => {
-                debug!(%message_id, ?target_device_id, payload = %payload, "ephemeral message received");
+                debug!(%message_id, "ephemeral message received");
                 let frame = ServerFrame::Ephemeral {
                     message_id: message_id.clone(),
                     payload,
@@ -323,7 +453,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                 target_device_id,
                 ephemeral: false,
             } => {
-                debug!(%message_id, ?target_device_id, payload = %payload, "message received");
+                debug!(%message_id, "message received");
                 let _delivery = state.delivery.lock(&query.id).await;
                 match state
                     .database
@@ -358,6 +488,11 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
                     }
                 }
             }
+            ClientFrame::Auth { .. } => {
+                tx.send(ServerFrame::Error {
+                    message: "invalid frame: auth is only valid as the first frame".to_string(),
+                });
+            }
             ClientFrame::Ack { sequence } => {
                 debug!(sequence, "acknowledgement received");
                 let _delivery = state.delivery.lock(&query.id).await;
@@ -380,7 +515,7 @@ async fn serve_socket_inner(state: AppState, query: ConnectQuery, mut socket: We
         .remove(&query.id, query.endpoint, &query.device_id, token);
     writer.abort();
     let _ = writer.await;
-    debug!(device_id = %query.device_id, "WebSocket endpoint disconnected");
+    debug!("WebSocket endpoint disconnected");
 }
 
 /// Delivers an ephemeral message to the peer endpoint's live devices without
@@ -451,6 +586,9 @@ pub(crate) async fn run(args: Args) -> Result<()> {
         hub: Arc::default(),
         limits,
         delivery: Arc::default(),
+        require_auth: args.require_auth,
+        client_ip_header: args.client_ip_header.as_deref().map(Arc::from),
+        connect_limit: Arc::new(RateLimiter::new(args.max_connections_per_minute)),
     };
     let router = Router::new()
         .route("/ws", get(websocket_handler))
@@ -459,7 +597,11 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
         .with_context(|| format!("failed to bind {}", args.bind))?;
-    info!(bind = %args.bind, "relay listening");
+    info!(
+        bind = %args.bind,
+        require_auth = args.require_auth,
+        "relay listening"
+    );
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),

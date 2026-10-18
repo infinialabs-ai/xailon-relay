@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub mod auth;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -46,9 +48,10 @@ pub enum ClientFrame {
         ephemeral: bool,
     },
     /// Cumulative acknowledgement for all received sequences up to this one.
-    Ack {
-        sequence: u64,
-    },
+    Ack { sequence: u64 },
+    /// Channel auth token (base64url, no padding). The first frame of a
+    /// connection opened with `auth=1`; see [`auth`].
+    Auth { token: String },
 }
 
 /// Frames emitted by the relay server.

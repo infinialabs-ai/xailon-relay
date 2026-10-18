@@ -125,7 +125,8 @@ struct CollectHandler {
 
 impl ClientHandler for CollectHandler {
     fn on_connected(&self) {
-        self.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn on_payload(&self, payload: Value) {
@@ -253,11 +254,7 @@ async fn replays_only_unacked_messages_after_server_restart() {
 
     let handler = Arc::new(CollectHandler::default());
     let url = format!("ws://127.0.0.1:{port}/ws?id=pair-r&endpoint=1&device_id=c1");
-    let client = Client::new(
-        url,
-        Arc::new(TestStore::default()),
-        handler.clone(),
-    );
+    let client = Client::new(url, Arc::new(TestStore::default()), handler.clone());
     let run_task = tokio::spawn(client.into_task());
 
     // Endpoint 2 sends while both are online; the client processes and acks.
@@ -363,7 +360,10 @@ async fn sends_live_messages_while_connected_and_removes_on_stored() {
         matches!(frame, ServerFrame::Message { .. })
     })
     .await;
-    let ServerFrame::Message { sequence, payload, .. } = frame else {
+    let ServerFrame::Message {
+        sequence, payload, ..
+    } = frame
+    else {
         unreachable!()
     };
     assert_eq!(payload, json!({ "live": 42 }));
@@ -401,7 +401,10 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
         },
     )
     .await;
-    let _ = read_until(&mut endpoint_one, |f| matches!(f, ServerFrame::Stored { .. })).await;
+    let _ = read_until(&mut endpoint_one, |f| {
+        matches!(f, ServerFrame::Stored { .. })
+    })
+    .await;
 
     send_client_frame(
         &mut endpoint_one,
@@ -413,7 +416,10 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
         },
     )
     .await;
-    let _ = read_until(&mut endpoint_one, |f| matches!(f, ServerFrame::Stored { .. })).await;
+    let _ = read_until(&mut endpoint_one, |f| {
+        matches!(f, ServerFrame::Stored { .. })
+    })
+    .await;
 
     // Start client for endpoint 2 with ack_head = true
     let store = Arc::new(TestStore::default());
@@ -440,7 +446,10 @@ async fn ack_head_client_purges_backlog_and_receives_live_message() {
         },
     )
     .await;
-    let _ = read_until(&mut endpoint_one, |f| matches!(f, ServerFrame::Stored { .. })).await;
+    let _ = read_until(&mut endpoint_one, |f| {
+        matches!(f, ServerFrame::Stored { .. })
+    })
+    .await;
 
     // Handler should receive ONLY live message 3; old 1 and 2 were dropped
     wait_until(
@@ -464,7 +473,8 @@ struct PoisonPillHandler {
 impl ClientHandler for PoisonPillHandler {
     fn on_payload(&self, _payload: Value) {}
     fn on_disconnected(&self, _error: Option<String>) {
-        self.disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.disconnected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     fn on_message_rejected(&self, message_id: &str, reason: &str) {
         self.rejected
@@ -530,7 +540,11 @@ async fn rejected_message_does_not_poison_outbox_or_disconnect_client() {
     assert!(reason.contains("message_id was already used with a different payload"));
 
     // Verify client did NOT disconnect
-    assert!(!handler.disconnected.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(
+        !handler
+            .disconnected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Wait until outbox is completely drained without poison pill loop
     wait_until(
@@ -547,4 +561,3 @@ async fn rejected_message_does_not_poison_outbox_or_disconnect_client() {
 
     run_task.abort();
 }
-

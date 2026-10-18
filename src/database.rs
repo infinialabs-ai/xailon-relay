@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::Limits,
-    entity::{counter, device, pending_message, receipt},
+    entity::{channel, counter, device, pending_message, receipt},
 };
 
 const MAX_ID_BYTES: usize = 256;
@@ -206,6 +206,64 @@ impl Database {
                 .transpose()?;
         transaction.commit().await?;
         Ok(StoreResult { pending })
+    }
+
+    /// Checks a connection's channel auth before it may use the channel.
+    /// Self-certifying ids are verified against the token without storage.
+    /// Other ids are claimed by the first authenticated connection; after
+    /// that, every connection must present the same token. Unclaimed ids
+    /// accept unauthenticated connections unless `require_auth` is set.
+    pub(crate) async fn authenticate(
+        &self,
+        relay_id: &str,
+        token: Option<&[u8; 32]>,
+        require_auth: bool,
+    ) -> std::result::Result<(), AuthError> {
+        if relay::auth::is_self_certifying(relay_id) {
+            let token = token.ok_or(AuthError::Required)?;
+            return if relay::auth::constant_time_eq(
+                relay::auth::channel_id(token).as_bytes(),
+                relay_id.as_bytes(),
+            ) {
+                Ok(())
+            } else {
+                Err(AuthError::Failed)
+            };
+        }
+        let now = unix_timestamp()?;
+        let claim = channel::Entity::find_by_id(relay_id.to_owned())
+            .one(&self.connection)
+            .await
+            .map_err(anyhow::Error::from)?;
+        match (claim, token) {
+            (Some(claim), Some(token)) => {
+                let expected = relay::auth::verifier(relay_id, token);
+                if !relay::auth::constant_time_eq(expected.as_bytes(), claim.verifier.as_bytes()) {
+                    return Err(AuthError::Failed);
+                }
+                let mut claim = claim.into_active_model();
+                claim.last_seen_at = Set(now);
+                claim
+                    .update(&self.connection)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                Ok(())
+            }
+            (Some(_), None) => Err(AuthError::Required),
+            (None, Some(token)) => {
+                channel::ActiveModel {
+                    relay_id: Set(relay_id.to_owned()),
+                    verifier: Set(relay::auth::verifier(relay_id, token)),
+                    last_seen_at: Set(now),
+                }
+                .insert(&self.connection)
+                .await
+                .map_err(anyhow::Error::from)?;
+                Ok(())
+            }
+            (None, None) if require_auth => Err(AuthError::Required),
+            (None, None) => Ok(()),
+        }
     }
 
     pub(crate) async fn register_device(
@@ -515,6 +573,11 @@ impl Database {
             .exec(&transaction)
             .await?
             .rows_affected;
+        // A claim lapses with its devices, so abandoned ids do not pin rows.
+        channel::Entity::delete_many()
+            .filter(channel::Column::LastSeenAt.lt(device_cutoff))
+            .exec(&transaction)
+            .await?;
 
         transaction.commit().await?;
 
@@ -524,6 +587,22 @@ impl Database {
             expired_receipts: usize::try_from(expired_pending_receipts + expired_receipts)
                 .context("expired receipt count is too large")?,
         })
+    }
+}
+
+/// Why a connection may not use a channel.
+#[derive(Debug)]
+pub(crate) enum AuthError {
+    /// The channel needs a token and none was sent.
+    Required,
+    /// The token does not match the channel.
+    Failed,
+    Storage(anyhow::Error),
+}
+
+impl From<anyhow::Error> for AuthError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Storage(error)
     }
 }
 
@@ -540,6 +619,7 @@ async fn initialize_schema(connection: &DatabaseConnection) -> Result<()> {
         schema.create_table_from_entity(receipt::Entity),
         schema.create_table_from_entity(pending_message::Entity),
         schema.create_table_from_entity(device::Entity),
+        schema.create_table_from_entity(channel::Entity),
     ] {
         table.if_not_exists();
         connection.execute(&table).await?;
@@ -549,7 +629,8 @@ async fn initialize_schema(connection: &DatabaseConnection) -> Result<()> {
         .create_index_from_entity(receipt::Entity)
         .into_iter()
         .chain(schema.create_index_from_entity(pending_message::Entity))
-        .chain(schema.create_index_from_entity(device::Entity));
+        .chain(schema.create_index_from_entity(device::Entity))
+        .chain(schema.create_index_from_entity(channel::Entity));
     for mut index in indexes {
         index.if_not_exists();
         connection.execute(&index).await?;
@@ -591,7 +672,10 @@ pub(crate) fn validate_message_id(message_id: &str) -> Result<()> {
 
 pub(crate) fn validate_target_device_id(device_id: &str) -> Result<()> {
     anyhow::ensure!(!device_id.is_empty(), "target_device_id must not be empty");
-    anyhow::ensure!(device_id.len() <= MAX_ID_BYTES, "target_device_id is too long");
+    anyhow::ensure!(
+        device_id.len() <= MAX_ID_BYTES,
+        "target_device_id is too long"
+    );
     Ok(())
 }
 
@@ -812,15 +896,33 @@ mod tests {
 
         // Store 3 messages destined for Endpoint::Two
         database
-            .store("pair-m", Endpoint::One, "msg-1", &serde_json::json!("first"), None)
+            .store(
+                "pair-m",
+                Endpoint::One,
+                "msg-1",
+                &serde_json::json!("first"),
+                None,
+            )
             .await
             .unwrap();
         database
-            .store("pair-m", Endpoint::One, "msg-2", &serde_json::json!("second"), None)
+            .store(
+                "pair-m",
+                Endpoint::One,
+                "msg-2",
+                &serde_json::json!("second"),
+                None,
+            )
             .await
             .unwrap();
         database
-            .store("pair-m", Endpoint::One, "msg-3", &serde_json::json!("third"), None)
+            .store(
+                "pair-m",
+                Endpoint::One,
+                "msg-3",
+                &serde_json::json!("third"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -917,15 +1019,33 @@ mod tests {
             .unwrap();
 
         database
-            .store("pair-h", Endpoint::One, "msg-1", &serde_json::json!("1"), None)
+            .store(
+                "pair-h",
+                Endpoint::One,
+                "msg-1",
+                &serde_json::json!("1"),
+                None,
+            )
             .await
             .unwrap();
         database
-            .store("pair-h", Endpoint::One, "msg-2", &serde_json::json!("2"), None)
+            .store(
+                "pair-h",
+                Endpoint::One,
+                "msg-2",
+                &serde_json::json!("2"),
+                None,
+            )
             .await
             .unwrap();
         database
-            .store("pair-h", Endpoint::One, "msg-3", &serde_json::json!("3"), None)
+            .store(
+                "pair-h",
+                Endpoint::One,
+                "msg-3",
+                &serde_json::json!("3"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -975,7 +1095,13 @@ mod tests {
 
         // Subsequent message arrives with sequence 4
         database
-            .store("pair-h", Endpoint::One, "msg-4", &serde_json::json!("4"), None)
+            .store(
+                "pair-h",
+                Endpoint::One,
+                "msg-4",
+                &serde_json::json!("4"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1011,7 +1137,13 @@ mod tests {
 
         // When a single device connects with acknowledge_head and no other devices exist:
         database
-            .store("pair-single", Endpoint::One, "s-1", &serde_json::json!("s1"), None)
+            .store(
+                "pair-single",
+                Endpoint::One,
+                "s-1",
+                &serde_json::json!("s1"),
+                None,
+            )
             .await
             .unwrap();
         let deleted = database
@@ -1043,19 +1175,37 @@ mod tests {
 
         // Broadcast message (seq 1)
         database
-            .store("pair-target", Endpoint::One, "m1", &serde_json::json!("all"), None)
+            .store(
+                "pair-target",
+                Endpoint::One,
+                "m1",
+                &serde_json::json!("all"),
+                None,
+            )
             .await
             .unwrap();
 
         // Targeted to phone_a (seq 2)
         database
-            .store("pair-target", Endpoint::One, "m2", &serde_json::json!("for_a"), Some("phone_a"))
+            .store(
+                "pair-target",
+                Endpoint::One,
+                "m2",
+                &serde_json::json!("for_a"),
+                Some("phone_a"),
+            )
             .await
             .unwrap();
 
         // Targeted to phone_b (seq 3)
         database
-            .store("pair-target", Endpoint::One, "m3", &serde_json::json!("for_b"), Some("phone_b"))
+            .store(
+                "pair-target",
+                Endpoint::One,
+                "m3",
+                &serde_json::json!("for_b"),
+                Some("phone_b"),
+            )
             .await
             .unwrap();
 

@@ -145,8 +145,12 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
     );
 
     // Phone A and Phone B both ack sequence 1
-    send(&mut phone_a, &ClientFrame::Ack { sequence: 1 }).await.unwrap();
-    send(&mut phone_b, &ClientFrame::Ack { sequence: 1 }).await.unwrap();
+    send(&mut phone_a, &ClientFrame::Ack { sequence: 1 })
+        .await
+        .unwrap();
+    send(&mut phone_b, &ClientFrame::Ack { sequence: 1 })
+        .await
+        .unwrap();
 
     // 4. Now simulate Phone B going offline (disconnects)
     phone_b.close(None).await.unwrap();
@@ -180,14 +184,17 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
             payload: json!({ "content": "offline_for_b" }),
         }
     );
-    send(&mut phone_a, &ClientFrame::Ack { sequence: 2 }).await.unwrap();
+    send(&mut phone_a, &ClientFrame::Ack { sequence: 2 })
+        .await
+        .unwrap();
 
     // 6. Now Phone A goes offline (user switches to Phone B!)
     phone_a.close(None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 7. Phone B reconnects! Phone B should immediately receive message 2 (which it missed)!
-    let mut phone_b_reconnected = connect_device(port, "pair-multi", Endpoint::Two, "phone_b").await;
+    let mut phone_b_reconnected =
+        connect_device(port, "pair-multi", Endpoint::Two, "phone_b").await;
     expect_ready(&mut phone_b_reconnected, Endpoint::Two).await;
 
     // Phone B gets the replayed message 2
@@ -199,7 +206,9 @@ async fn multi_device_broadcast_and_switching_without_gaps() {
             payload: json!({ "content": "offline_for_b" }),
         }
     );
-    send(&mut phone_b_reconnected, &ClientFrame::Ack { sequence: 2 }).await.unwrap();
+    send(&mut phone_b_reconnected, &ClientFrame::Ack { sequence: 2 })
+        .await
+        .unwrap();
 
     // 8. Desktop sends message 3: Phone B receives it directly!
     send(
@@ -313,7 +322,10 @@ async fn health_check_http_endpoint() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "health check failed: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "health check failed: {response}"
+    );
     assert!(response.contains("OK"));
 }
 
@@ -369,7 +381,9 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             payload: json!({ "msg": "only_for_a" }),
         }
     );
-    send(&mut phone_a, &ClientFrame::Ack { sequence: 1 }).await.unwrap();
+    send(&mut phone_a, &ClientFrame::Ack { sequence: 1 })
+        .await
+        .unwrap();
 
     // Phone B must NOT receive this message!
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -401,7 +415,9 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             payload: json!({ "msg": "only_for_b" }),
         }
     );
-    send(&mut phone_b, &ClientFrame::Ack { sequence: 2 }).await.unwrap();
+    send(&mut phone_b, &ClientFrame::Ack { sequence: 2 })
+        .await
+        .unwrap();
 
     // 4. Now simulate Phone A going offline
     phone_a.close(None).await.unwrap();
@@ -430,7 +446,8 @@ async fn multi_device_targeted_routing_and_offline_replay() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 6. Phone A reconnects! Phone A should receive its missed targeted message!
-    let mut phone_a_reconnected = connect_device(port, "pair-target", Endpoint::Two, "phone_a").await;
+    let mut phone_a_reconnected =
+        connect_device(port, "pair-target", Endpoint::Two, "phone_a").await;
     expect_ready(&mut phone_a_reconnected, Endpoint::Two).await;
 
     assert_eq!(
@@ -441,5 +458,7 @@ async fn multi_device_targeted_routing_and_offline_replay() {
             payload: json!({ "msg": "offline_for_a" }),
         }
     );
-    send(&mut phone_a_reconnected, &ClientFrame::Ack { sequence: 3 }).await.unwrap();
+    send(&mut phone_a_reconnected, &ClientFrame::Ack { sequence: 3 })
+        .await
+        .unwrap();
 }

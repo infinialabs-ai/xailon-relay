@@ -10,6 +10,7 @@ const DEFAULT_RECEIPT_RETENTION_SECS: u64 = 60 * 60;
 const DEFAULT_DEVICE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 10 * 60;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_MAX_CONNECTIONS_PER_MINUTE: u32 = 120;
 
 /// How often an established connection is pinged. A connection that sends
 /// nothing for `DEFAULT_IDLE_TIMEOUT_SECS` — three ping intervals — is
@@ -88,6 +89,26 @@ pub(crate) struct Args {
         default_value_t = DEFAULT_IDLE_TIMEOUT_SECS
     )]
     pub(crate) idle_timeout_secs: u64,
+
+    /// Refuse connections to unclaimed channels that do not authenticate.
+    /// Recommended for internet-facing relays once every client sends a
+    /// channel auth token.
+    #[arg(long, env = "RELAY_REQUIRE_AUTH")]
+    pub(crate) require_auth: bool,
+
+    /// New WebSocket connections allowed per client IP per minute (0 = no limit).
+    #[arg(
+        long,
+        env = "RELAY_MAX_CONNECTIONS_PER_MINUTE",
+        default_value_t = DEFAULT_MAX_CONNECTIONS_PER_MINUTE
+    )]
+    pub(crate) max_connections_per_minute: u32,
+
+    /// Request header holding the client IP, set by a trusted reverse proxy
+    /// (for example `X-Forwarded-For` or `CF-Connecting-IP`). Without it, the
+    /// TCP peer address is used.
+    #[arg(long, env = "RELAY_CLIENT_IP_HEADER")]
+    pub(crate) client_ip_header: Option<String>,
 }
 
 impl Args {

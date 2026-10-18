@@ -21,7 +21,10 @@ use crate::relay_frame::{
 pub enum Inbound {
     Frame(ServerFrame),
     /// An ephemeral binary message from the peer.
-    Binary { message_id: String, body: Bytes },
+    Binary {
+        message_id: String,
+        body: Bytes,
+    },
 }
 
 /// Cloneable handle that writes to a connected transport from outside the

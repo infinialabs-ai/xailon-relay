@@ -52,11 +52,8 @@ mod tests {
         let lock_a = keyed_lock.lock("key_a").await;
 
         // "key_b" should be acquired immediately even though "key_a" is held
-        let lock_b_res = tokio::time::timeout(
-            Duration::from_millis(100),
-            keyed_lock.lock("key_b"),
-        )
-        .await;
+        let lock_b_res =
+            tokio::time::timeout(Duration::from_millis(100), keyed_lock.lock("key_b")).await;
 
         assert!(lock_b_res.is_ok());
         drop(lock_a);
@@ -68,20 +65,14 @@ mod tests {
 
         let lock_1 = keyed_lock.lock("same_key").await;
 
-        let lock_2_res = tokio::time::timeout(
-            Duration::from_millis(50),
-            keyed_lock.lock("same_key"),
-        )
-        .await;
+        let lock_2_res =
+            tokio::time::timeout(Duration::from_millis(50), keyed_lock.lock("same_key")).await;
         assert!(lock_2_res.is_err(), "second lock on same key must block");
 
         drop(lock_1);
 
-        let lock_2_res = tokio::time::timeout(
-            Duration::from_millis(50),
-            keyed_lock.lock("same_key"),
-        )
-        .await;
+        let lock_2_res =
+            tokio::time::timeout(Duration::from_millis(50), keyed_lock.lock("same_key")).await;
         assert!(lock_2_res.is_ok(), "lock succeeds after release");
     }
 }

@@ -21,7 +21,10 @@ const MAX_QUEUED_EPHEMERAL_BYTES: usize = 16 * 1024 * 1024;
 enum Outgoing {
     Frame(ServerFrame),
     /// Pre-encoded so a broadcast shares one buffer across devices.
-    Ephemeral { message: Message, size: usize },
+    Ephemeral {
+        message: Message,
+        size: usize,
+    },
 }
 
 /// Sending half of one connection's outgoing queue.
@@ -258,9 +261,18 @@ mod tests {
         let _t3 = hub.register("pair-2", Endpoint::Two, "dev3", tx3, Vec::new());
 
         // Drain Ready frames
-        assert!(matches!(frame(&mut rx1).await, Some(ServerFrame::Ready { .. })));
-        assert!(matches!(frame(&mut rx2).await, Some(ServerFrame::Ready { .. })));
-        assert!(matches!(frame(&mut rx3).await, Some(ServerFrame::Ready { .. })));
+        assert!(matches!(
+            frame(&mut rx1).await,
+            Some(ServerFrame::Ready { .. })
+        ));
+        assert!(matches!(
+            frame(&mut rx2).await,
+            Some(ServerFrame::Ready { .. })
+        ));
+        assert!(matches!(
+            frame(&mut rx3).await,
+            Some(ServerFrame::Ready { .. })
+        ));
 
         // Send broadcast to (pair-1, Endpoint::Two)
         let test_frame = ServerFrame::Stored {
@@ -278,13 +290,21 @@ mod tests {
         // Register dev4 also on (pair-1, Endpoint::Two)
         let (tx4, mut rx4) = connection_channel();
         let _t4 = hub.register("pair-1", Endpoint::Two, "dev4", tx4, Vec::new());
-        assert!(matches!(frame(&mut rx4).await, Some(ServerFrame::Ready { .. })));
+        assert!(matches!(
+            frame(&mut rx4).await,
+            Some(ServerFrame::Ready { .. })
+        ));
 
         // Send targeted to dev4 only
         let targeted_frame = ServerFrame::Stored {
             message_id: "test-targeted".to_string(),
         };
-        hub.send_to_endpoint("pair-1", Endpoint::Two, Some("dev4"), targeted_frame.clone());
+        hub.send_to_endpoint(
+            "pair-1",
+            Endpoint::Two,
+            Some("dev4"),
+            targeted_frame.clone(),
+        );
 
         // dev4 receives it
         assert_eq!(frame(&mut rx4).await, Some(targeted_frame));
@@ -309,7 +329,9 @@ mod tests {
         let ready1 = frame(&mut rx1).await.unwrap();
         assert!(matches!(ready1, ServerFrame::Ready { .. }));
         let err1 = frame(&mut rx1).await.unwrap();
-        assert!(matches!(err1, ServerFrame::Error { message, .. } if message.starts_with("connection_replaced")));
+        assert!(
+            matches!(err1, ServerFrame::Error { message, .. } if message.starts_with("connection_replaced"))
+        );
 
         // Removing with old token does nothing
         hub.remove("pair-x", Endpoint::One, "phone", t1);
@@ -326,7 +348,10 @@ mod tests {
         let hub = Hub::default();
         let (tx, mut rx) = connection_channel();
         hub.register("pair-e", Endpoint::Two, "phone", tx, Vec::new());
-        assert!(matches!(frame(&mut rx).await, Some(ServerFrame::Ready { .. })));
+        assert!(matches!(
+            frame(&mut rx).await,
+            Some(ServerFrame::Ready { .. })
+        ));
 
         let send = |target, size| {
             let message = Message::Binary(vec![0; 4].into());
